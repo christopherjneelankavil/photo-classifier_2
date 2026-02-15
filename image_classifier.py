@@ -195,6 +195,125 @@ def is_smiling(face_analysis: dict) -> bool:
 
 # ─── specialOps ──────────────────────────────────────────────────────
 
+# Named-color lookup table  (BGR order for OpenCV)
+_COLOR_TABLE = [
+    ((0,   0,   0),   "black"),
+    ((255, 255, 255), "white"),
+    ((128, 128, 128), "gray"),
+    ((0,   0,   200), "red"),
+    ((200, 0,   0),   "blue"),
+    ((0,   128, 0),   "green"),
+    ((0,   255, 255), "yellow"),
+    ((0,   165, 255), "orange"),
+    ((203, 192, 255), "pink"),
+    ((128, 0,   128), "purple"),
+    ((42,  42,  165), "brown"),
+    ((185, 218, 245), "beige"),
+    ((0,   128, 128), "olive"),
+    ((128, 128, 0),   "teal"),
+    ((0,   0,   128), "maroon"),
+    ((235, 206, 135), "light blue"),
+]
+
+
+def _nearest_color_name(bgr):
+    """Map a BGR tuple to the closest human-readable colour name."""
+    best_name = "unknown"
+    best_dist = float("inf")
+    for ref_bgr, name in _COLOR_TABLE:
+        dist = sum((a - b) ** 2 for a, b in zip(bgr, ref_bgr))
+        if dist < best_dist:
+            best_dist = dist
+            best_name = name
+    return best_name
+
+
+def _get_dominant_color(image, region: dict) -> str:
+    """
+    Extract the torso region below a detected face and return the dominant
+    colour name via K-means (k=3).
+
+    Parameters
+    ----------
+    image  : BGR numpy array (full image)
+    region : dict with keys x, y, w, h  (face bounding box from DeepFace)
+
+    Returns
+    -------
+    str – human-readable colour name, or ``"unknown"``.
+    """
+    h_img, w_img = image.shape[:2]
+    fx, fy, fw, fh = region["x"], region["y"], region["w"], region["h"]
+
+    # Torso crop: start just below the face, extend 1.5× face-height down,
+    # widen by 30 % on each side.
+    expand = int(fw * 0.3)
+    x1 = max(fx - expand, 0)
+    x2 = min(fx + fw + expand, w_img)
+    y1 = min(fy + fh, h_img)
+    y2 = min(fy + fh + int(fh * 1.5), h_img)
+
+    if y2 - y1 < 10 or x2 - x1 < 10:
+        return "unknown"
+
+    crop = image[y1:y2, x1:x2]
+    pixels = crop.reshape(-1, 3).astype(np.float32)
+
+    if len(pixels) < 30:
+        return "unknown"
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    _, labels, centres = cv2.kmeans(
+        pixels, 3, None, criteria, 3, cv2.KMEANS_PP_CENTERS
+    )
+    # Pick the cluster with the most pixels
+    counts = np.bincount(labels.flatten())
+    dominant_bgr = centres[counts.argmax()].astype(int)
+
+    return _nearest_color_name(tuple(dominant_bgr))
+
+
+def _get_dress_type(image, region: dict) -> str:
+    """
+    Heuristic dress-type classification based on colour uniformity
+    in the torso region.
+
+    Returns one of: ``"formal"``, ``"casual"``, ``"patterned"``,
+    or ``"unknown"``.
+    """
+    h_img, w_img = image.shape[:2]
+    fx, fy, fw, fh = region["x"], region["y"], region["w"], region["h"]
+
+    expand = int(fw * 0.3)
+    x1 = max(fx - expand, 0)
+    x2 = min(fx + fw + expand, w_img)
+    y1 = min(fy + fh, h_img)
+    y2 = min(fy + fh + int(fh * 1.5), h_img)
+
+    if y2 - y1 < 10 or x2 - x1 < 10:
+        return "unknown"
+
+    crop = image[y1:y2, x1:x2]
+    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    h_channel = hsv[:, :, 0].flatten().astype(np.float32)
+    s_channel = hsv[:, :, 1].flatten().astype(np.float32)
+
+    if len(h_channel) < 30:
+        return "unknown"
+
+    hue_std = np.std(h_channel)
+    sat_mean = np.mean(s_channel)
+
+    # High hue variation → patterned / multi-colour
+    if hue_std > 35:
+        return "patterned"
+    # Low saturation + low hue variation → formal (dark suit, white shirt, etc.)
+    if sat_mean < 50 and hue_std < 15:
+        return "formal"
+    # Otherwise classify as casual
+    return "casual"
+
+
 def _get_age_category(age_val):
     """
     Map numerical age to descriptive category.
@@ -237,18 +356,33 @@ def special_ops(image_path: str, analysis: list) -> dict:
 
     Returns
     -------
-    dict  with keys: filename, faces (list of {face_number, dominant_emotion, age, gender})
+    dict  with keys: filename, faces (list of {face_number, dominant_emotion,
+          age, gender, dress_color, dress_type})
     """
+    # Load the image once for dress analysis
+    img = cv2.imread(image_path)
+
     faces = []
     for i, face in enumerate(analysis):
         age_val = face.get("age", "unknown")
         age_cat = _get_age_category(age_val)
-        
+
+        # Dress attributes (need the face bounding-box region)
+        region = face.get("region", {})
+        if img is not None and region:
+            dress_color = _get_dominant_color(img, region)
+            dress_type  = _get_dress_type(img, region)
+        else:
+            dress_color = "unknown"
+            dress_type  = "unknown"
+
         face_record = {
             "face_number": i + 1,
             "dominant_emotion": face.get("dominant_emotion", "unknown"),
             "age": age_cat,
             "gender": face.get("dominant_gender", "unknown"),
+            "dress_color": dress_color,
+            "dress_type": dress_type,
         }
         faces.append(face_record)
 
@@ -257,6 +391,8 @@ def special_ops(image_path: str, analysis: list) -> dict:
         print(f"    Dominant Emotion : {face_record['dominant_emotion']}")
         print(f"    Probable Age     : {face_record['age']}")
         print(f"    Gender           : {face_record['gender']}")
+        print(f"    Dress Colour     : {face_record['dress_color']}")
+        print(f"    Dress Type       : {face_record['dress_type']}")
         print("    " + "-" * 30)
 
     return {
